@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-test/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.csv
+!test/fixtures/**/*.csv
