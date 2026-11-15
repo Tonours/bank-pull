@@ -12,3 +12,4 @@ dist-test/
 *.sqlite-*
 *.csv
 !test/fixtures/**/*.csv
+PLAN.md
