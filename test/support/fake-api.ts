@@ -157,6 +157,10 @@ export async function startFakeApi(appId: string, publicKeyPem: string): Promise
         if (failure !== undefined && failure.atRequest === count) return fail(res, failure.error);
         if (state.hangTransactions.get(account) === count) return;
         const from = query["date_from"];
+        // Real API rule (seen live): date_to without date_from is refused.
+        if (query["date_to"] !== undefined && from === undefined) {
+          return json(res, 422, { error: "DATE_TO_WITHOUT_DATE_FROM", message: "date_from must be provided if date_to provided" });
+        }
         if (from !== undefined && state.oldestServed !== undefined && from < state.oldestServed) {
           return json(res, 422, { error: "WRONG_TRANSACTIONS_PERIOD", message: "date_from too old" });
         }

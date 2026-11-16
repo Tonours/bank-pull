@@ -386,7 +386,7 @@ export async function backfillAccount(ctx: SyncContext, accountId: number, uid: 
   const inserted: InsertedRow[] = [];
   let run: Run;
   try {
-    run = await fetchRun(ctx, accountId, uid, { strategy: "longest", date_to: isoDate(ctx.now) }, inserted);
+    run = await fetchRun(ctx, accountId, uid, { strategy: "longest" }, inserted);
   } catch (error) {
     throw mapApiError(error);
   }
@@ -432,7 +432,7 @@ export async function syncAccount(ctx: SyncContext, accountId: number, uid: stri
       if (first.pages > 0 || !(error instanceof ApiError && error.code === "WRONG_TRANSACTIONS_PERIOD")) throw error;
       recovered = true;
       warnings.push(`the bank refused date_from ${dateFrom} (WRONG_TRANSACTIONS_PERIOD); retried once without it`);
-      run = await fetchRun(ctx, accountId, uid, { date_to: today, strategy: "longest" }, inserted);
+      run = await fetchRun(ctx, accountId, uid, { strategy: "longest" }, inserted);
     }
   } catch (error) {
     throw mapApiError(error);

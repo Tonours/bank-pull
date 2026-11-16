@@ -180,7 +180,7 @@ function summarize(results: readonly AccountResult[], statuses: readonly Account
     }
     for (const gap of r.gaps_added) io.stdout(`  warning: history gap recorded (${gap.kind}); older history may be shorter than the bank's window\n`);
     const permanent = statuses.find((s) => s.account_id === r.account_id)?.warnings ?? [];
-    for (const warning of [...r.warnings, ...permanent]) io.stdout(`  warning: ${warning}\n`);
+    for (const warning of new Set([...r.warnings, ...permanent])) io.stdout(`  warning: ${warning}\n`);
   }
 }
 
@@ -194,7 +194,9 @@ async function auth(args: readonly string[], paths: Paths, io: Io): Promise<numb
   try {
     const now = io.now?.() ?? new Date();
     const aspsps = await api.listAspsps(countryCode, "personal");
-    const aspsp = aspsps.find((a) => a.name === bankName);
+    // `banks` prints a " (beta)" marker after the name; accept the line as printed.
+    const wanted = bankName.replace(/ \(beta\)$/, "");
+    const aspsp = aspsps.find((a) => a.name === bankName) ?? aspsps.find((a) => a.name === wanted);
     if (aspsp === undefined) {
       const names = aspsps.map((a) => a.name).filter((n) => n.toLowerCase().includes(bankName.toLowerCase()));
       throw new CliError(`no bank named "${bankName}" in ${countryCode}${names.length > 0 ? `; did you mean: ${names.join(", ")}` : ""}`);

@@ -211,8 +211,8 @@ test("long downtime: strategy=longest from synced_through - 10, one retry withou
   assert.equal(run.code, 0, run.stderr);
   assert.deepEqual(txQueries(h, uid).slice(1), [
     { date_from: "2026-07-08", date_to: TODAY, strategy: "longest" },
-    { date_to: TODAY, strategy: "longest" },
-    { date_to: TODAY, strategy: "longest" },
+    { strategy: "longest" },
+    { strategy: "longest" },
   ]);
   assert.deepEqual(gaps(h).map((g) => [g.kind, g.from, g.to]), [["unserved-window", "2026-07-18", "2026-09-01"]]);
   assert.equal(h.value("SELECT synced_through AS v FROM accounts"), TODAY);
@@ -245,7 +245,7 @@ test("WRONG_TRANSACTIONS_PERIOD after a short downtime: exactly one retry, then 
   const { h, uid } = await authed([[[tx()]]], new Date("2026-10-15T09:00:00.000Z"));
   h.api.state.failTransactions.set(uid, { atRequest: 2, error: { status: 422, error: "WRONG_TRANSACTIONS_PERIOD" } });
   assert.equal((await sync(h)).code, 0);
-  assert.deepEqual(txQueries(h, uid).slice(1), [{ date_from: "2026-10-05", date_to: TODAY }, { date_to: TODAY, strategy: "longest" }]);
+  assert.deepEqual(txQueries(h, uid).slice(1), [{ date_from: "2026-10-05", date_to: TODAY }, { strategy: "longest" }]);
   assert.deepEqual(gaps(h).map((g) => [g.from, g.to]), [["2026-10-15", "2026-11-01"]]);
   h.api.state.failPath.set(`/accounts/${uid}/transactions`, { status: 422, error: "WRONG_TRANSACTIONS_PERIOD" });
   const before = txQueries(h, uid).length;
@@ -407,7 +407,7 @@ test("sync resumes an unfinished backfill with strategy=longest and records the 
   assert.equal(n(h, "SELECT backfill_done AS v FROM accounts"), 0);
   const run = await sync(h, NOW, true);
   assert.equal(run.code, 0, run.stderr);
-  assert.deepEqual(txQueries(h, uid).slice(2), [{ strategy: "longest", date_to: TODAY }, { strategy: "longest", date_to: TODAY }]);
+  assert.deepEqual(txQueries(h, uid).slice(2), [{ strategy: "longest" }, { strategy: "longest" }]);
   const out = JSON.parse(run.stdout) as { accounts: { mode: string; gaps_added: { kind: string }[] }[] };
   assert.equal(out.accounts[0]?.mode, "backfill");
   assert.deepEqual(out.accounts[0]?.gaps_added.map((g) => g.kind), ["interrupted-backfill"]);
@@ -415,6 +415,25 @@ test("sync resumes an unfinished backfill with strategy=longest and records the 
   assert.equal(n(h, "SELECT count(*) AS v FROM transactions"), 2);
   assert.deepEqual(gaps(h).map((g) => g.kind), ["interrupted-backfill"]);
   assert.match((await h.run(["status"], { now: NOW })).stdout, /initial backfill was interrupted/);
+});
+
+test("two interrupted backfills (auth, then a failed sync) record two gaps but warn once", async () => {
+  const h = await harness();
+  const s = session("sess-1", 1);
+  const uid = s.uids[0] ?? "";
+  install(h.api, s, [[[tx()]]]);
+  h.api.state.failTransactions.set(uid, { atRequest: 1, error: { status: 500, error: "ASPSP_ERROR" } });
+  assert.equal((await h.run(authArgs, { paste: (api) => callback(api), now: NOW })).code, ExitCode.failure);
+  h.api.state.failTransactions.set(uid, { atRequest: 2, error: { status: 500, error: "ASPSP_ERROR" } });
+  assert.equal((await sync(h)).code, ExitCode.failure);
+  h.api.state.failTransactions.clear();
+  const run = await sync(h);
+  assert.equal(run.code, 0, run.stderr);
+  assert.equal(gaps(h).length, 2);
+  assert.equal(run.stdout.match(/an initial backfill was interrupted/g)?.length, 1, run.stdout);
+  const status = await h.run(["status", "--json"], { now: NOW });
+  const parsed = JSON.parse(status.stdout) as { accounts: { warnings: string[] }[] };
+  assert.equal(parsed.accounts[0]?.warnings.filter((w) => w.includes("was interrupted")).length, 1);
 });
 
 test("status is offline and read-only: no key, no config, no request, DB bytes and data dir unchanged; warns under 14 days", async () => {

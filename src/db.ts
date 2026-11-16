@@ -281,11 +281,11 @@ export function syncStatus(db: DatabaseSync, now: Date): AccountStatus[] {
     else if (daysLeft !== null && daysLeft < CONSENT_WARNING_DAYS) warnings.push(`consent expires in ${daysLeft} day(s); run "bank-pull auth" soon`);
     if (row.backfill_done !== 1) warnings.push('initial backfill not complete; run "bank-pull sync"');
     for (const gap of gaps) {
-      warnings.push(
+      const warning =
         gap.kind === "interrupted-backfill"
           ? `an initial backfill was interrupted; history before ${row.covered_from ?? "the first booked row"} may be shorter than the bank's initial window`
-          : `history gap: booked transactions between ${gap.from} and ${gap.to} may be missing`,
-      );
+          : `history gap: booked transactions between ${gap.from} and ${gap.to} may be missing`;
+      if (!warnings.includes(warning)) warnings.push(warning);
     }
     if (row.skipped_undated > 0) warnings.push(`${row.skipped_undated} booked row(s) without any date or reference were skipped`);
     return {

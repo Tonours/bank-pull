@@ -343,6 +343,13 @@ test("a non-loopback API URL override is refused before any request", async () =
   assert.equal(h.api.requests.length, 0);
 });
 
+test("auth accepts the bank name exactly as `banks` prints it, beta marker included", async () => {
+  const h = await harness();
+  install(h.api, session("s", 1), [[[tx()]]]);
+  const run = await h.run(["auth", "--bank", `${BANK.name} (beta)`, "--country", "FR"], { paste: (api) => callback(api) });
+  assert.equal(run.code, 0, run.stderr);
+});
+
 test("an unknown bank name is refused with suggestions, before POST /auth", async () => {
   const h = await harness();
   const run = await h.run(["auth", "--bank", "synthetic", "--country", "FR"], { paste: () => "unused" });
