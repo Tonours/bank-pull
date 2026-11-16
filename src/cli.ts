@@ -3,15 +3,18 @@ import { randomUUID } from "node:crypto";
 import { realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
+import type { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import { parseArgs, type ParseArgsConfig } from "node:util";
-import { assertPrivate, ensurePrivateDir, loadConfig, readPrivateKey, resolvePaths, type Config, type Env, type Paths } from "./config.js";
-import { latestSession, openReadOnly, openReadWrite, syncStatus, type AccountStatus } from "./db.js";
+import { assertPrivate, ensurePrivateDir, loadConfig, resolvePaths, type Config, type Env, type Paths } from "./config.js";
+import { checkCategoryUpdate, latestSession, openReadOnly, openReadWrite, setCategory, syncStatus, type AccountStatus } from "./db.js";
 import { ApiError, DEFAULT_API_URL, EnableBankingClient } from "./enable-banking.js";
 import { CliError, ExitCode } from "./errors.js";
-import { loadSigningKey } from "./jwt.js";
+import { loadSigningKey, readPrivateKey } from "./jwt.js";
 import { acquireLock, lockedWrite, releaseLock } from "./lock.js";
+import { guardedQuery, listAccounts, QUERY_MAX_ROWS, searchTransactions, TRANSACTIONS_MAX_LIMIT, type QueryValue, type TransactionFilter } from "./read.js";
 import { backfillAccount, mapApiError, persistSession, syncAccount, type AccountResult, type SyncContext } from "./sync.js";
+import { printable } from "./text.js";
 
 export interface Io {
   readonly env: Env;
@@ -35,6 +38,16 @@ Commands:
                          close the latest consent at the bank and forget it locally
   sync [--json]          fetch new transactions and balances for every consented account
   status [--json]        offline: cursor, consent expiry and history gaps per account
+  accounts [--json]      offline: accounts with their latest balances
+  transactions [--account <id>] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--text <s>]
+               [--category <c>] [--status BOOK|PDNG|...|pending] [--min-amount <n>]
+               [--max-amount <n>] [--limit <n>] [--json]
+                         offline: transactions, newest first (--category "" = uncategorized;
+                         negative amounts as --max-amount=-12.30)
+  query "<SELECT ...>" [--max-rows <n>] [--json]
+                         offline: one read-only SQL statement (default 500 rows, max 5000)
+  categorize --id <n> [--category <c>] [--note <text>] [--json]
+                         set the category and/or note of one booked transaction (empty value clears)
 
 Exit codes: 0 ok, 1 failure, 2 usage, 3 consent expired or closed,
 4 bank rate limit, 5 another sync running, 6 unsafe file permissions.
@@ -157,9 +170,6 @@ export function consentValidUntil(now: Date, maximumSeconds: unknown): string {
   const whole = seconds >= DAY_SECONDS ? Math.floor(seconds / DAY_SECONDS) * DAY_SECONDS : Math.floor(seconds);
   return new Date(now.getTime() + whole * 1000).toISOString();
 }
-
-/** Bank-controlled text is printed without control or bidi characters (no terminal escapes, no visually reordered line). */
-const printable = (text: string): string => text.replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "?");
 
 function summarize(results: readonly AccountResult[], statuses: readonly AccountStatus[], io: Io): void {
   for (const r of results) {
@@ -318,6 +328,123 @@ function status(args: readonly string[], paths: Paths, io: Io): number {
   }
 }
 
+function withReadOnly<T>(paths: Paths, fn: (db: DatabaseSync) => T): T {
+  const db = openReadOnly(paths);
+  try {
+    return fn(db);
+  } finally {
+    db.close();
+  }
+}
+
+function json(io: Io, value: unknown): number {
+  io.stdout(`${JSON.stringify(value, null, 2)}\n`);
+  return 0;
+}
+
+const text = (value: string | boolean | undefined): string | undefined => (typeof value === "string" ? value : undefined);
+
+function integer(value: string | boolean | undefined, flag: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !/^\d{1,15}$/.test(value)) throw new CliError(`--${flag} must be a positive integer`, ExitCode.usage);
+  return Number(value);
+}
+
+/** Offline: accounts with their latest balances per type and currency. */
+function accounts(args: readonly string[], paths: Paths, io: Io): number {
+  const values = parse(args, { json: { type: "boolean" } });
+  const list = withReadOnly(paths, listAccounts);
+  if (values.json === true) return json(io, { accounts: list });
+  if (list.length === 0) io.stdout('no account yet; run "bank-pull auth"\n');
+  for (const a of list) {
+    const iban = a.iban === null ? "" : ` ${a.iban}`;
+    io.stdout(`${printable(`#${a.account_id} ${a.name ?? "(unnamed)"} (${a.bank})${iban}${a.currency === null ? "" : ` ${a.currency}`}`)}\n`);
+    if (a.balances.length === 0) io.stdout("  no balance fetched yet\n");
+    for (const b of a.balances) {
+      const date = b.reference_date === null ? "" : ` on ${b.reference_date}`;
+      io.stdout(`${printable(`  ${b.balance_type} ${b.amount} ${b.currency}${date} (fetched ${b.fetched_at})`)}\n`);
+    }
+  }
+  return 0;
+}
+
+/** Offline: filtered transactions, newest first. */
+function transactions(args: readonly string[], paths: Paths, io: Io): number {
+  const values = parse(args, {
+    account: { type: "string" },
+    from: { type: "string" },
+    to: { type: "string" },
+    text: { type: "string" },
+    category: { type: "string" },
+    status: { type: "string" },
+    "min-amount": { type: "string" },
+    "max-amount": { type: "string" },
+    limit: { type: "string" },
+    json: { type: "boolean" },
+  });
+  const filter: TransactionFilter = {
+    accountId: integer(values.account, "account"),
+    from: text(values.from),
+    to: text(values.to),
+    text: text(values.text),
+    category: text(values.category),
+    status: text(values.status),
+    minAmount: text(values["min-amount"]),
+    maxAmount: text(values["max-amount"]),
+    limit: integer(values.limit, "limit"),
+  };
+  const page = withReadOnly(paths, (db) => searchTransactions(db, filter));
+  if (values.json === true) return json(io, page);
+  for (const t of page.transactions) {
+    const label = [t.label, t.counterparty].filter((s) => s !== null && s !== "").join(" | ");
+    const category = t.category === null ? "" : ` [${t.category}]`;
+    const status = t.status === "BOOK" ? "" : ` (${t.status})`;
+    io.stdout(`${printable(`#${t.id} ${t.date ?? "????-??-??"} ${t.amount} ${t.currency}${status}${category} ${label}`)}\n`);
+  }
+  if (page.transactions.length === 0) io.stdout("no matching transaction\n");
+  if (page.truncated) io.stdout(`(more rows match; raise --limit, max ${TRANSACTIONS_MAX_LIMIT})\n`);
+  return 0;
+}
+
+/** Offline: one read-only SELECT through the guarded read path. */
+function query(args: readonly string[], paths: Paths, io: Io): number {
+  let parsed;
+  try {
+    parsed = parseArgs({ args: [...args], options: { json: { type: "boolean" }, "max-rows": { type: "string" } }, strict: true, allowPositionals: true });
+  } catch (error) {
+    throw new CliError((error as Error).message, ExitCode.usage);
+  }
+  const [sql, ...extra] = parsed.positionals;
+  if (sql === undefined || extra.length > 0) throw new CliError('query takes exactly one SQL argument (quote it: bank-pull query "SELECT ...")', ExitCode.usage);
+  const result = guardedQuery(paths, sql, integer(parsed.values["max-rows"], "max-rows"));
+  if (parsed.values.json === true) return json(io, result);
+  const cell = (value: QueryValue | undefined): string => (value === null || value === undefined ? "NULL" : printable(String(value)));
+  io.stdout(`${result.columns.map(printable).join("\t")}\n`);
+  for (const row of result.rows) io.stdout(`${result.columns.map((c) => cell(row[c])).join("\t")}\n`);
+  if (result.truncated) io.stdout(`(truncated at ${result.rows.length} rows; raise --max-rows, max ${QUERY_MAX_ROWS})\n`);
+  return 0;
+}
+
+/** The only write besides sync: sets or clears the category and note of one existing transaction; never creates the DB. */
+function categorize(args: readonly string[], paths: Paths, io: Io): number {
+  const values = parse(args, { id: { type: "string" }, category: { type: "string" }, note: { type: "string" }, json: { type: "boolean" } });
+  const id = integer(values.id, "id");
+  if (id === undefined) throw new CliError("missing --id (see bank-pull transactions)", ExitCode.usage);
+  const update = { category: text(values.category), note: text(values.note) };
+  checkCategoryUpdate(id, update);
+  assertPrivate(paths.dataDir, "dir");
+  assertPrivate(paths.dbFile, "file");
+  const db = openReadWrite(paths);
+  try {
+    const row = setCategory(db, id, update);
+    if (values.json === true) return json(io, row);
+    io.stdout(`${printable(`#${row.id} category ${row.category ?? "(none)"}, note ${row.note ?? "(none)"}`)}\n`);
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
 export async function main(argv: readonly string[], io: Io): Promise<number> {
   const [command, ...rest] = argv;
   if (command === undefined || command === "--help" || command === "-h" || command === "help") {
@@ -339,6 +466,14 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
         return await sync(rest, paths, io);
       case "status":
         return status(rest, paths, io);
+      case "accounts":
+        return accounts(rest, paths, io);
+      case "transactions":
+        return transactions(rest, paths, io);
+      case "query":
+        return query(rest, paths, io);
+      case "categorize":
+        return categorize(rest, paths, io);
       default:
         io.stderr(`bank-pull: unknown command "${command}"\n${USAGE}`);
         return ExitCode.usage;

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { formatMinor, toMinorUnits } from "./amount.js";
 import type { Gap } from "./db.js";
+import { isCalendarDay } from "./day.js";
 import { ApiError, type Balance, type EnableBankingClient, type Session, type Transaction, type TransactionQuery } from "./enable-banking.js";
 import { CliError, ExitCode } from "./errors.js";
 import { lockedWrite } from "./lock.js";
@@ -9,7 +10,6 @@ import { lockedWrite } from "./lock.js";
 const MAX_PAGES = 10_000;
 /** Cancelled and rejected rows are never stored; every other non-BOOK status is part of the pending snapshot. */
 const DROPPED = new Set(["CNCL", "RJCT"]);
-const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
 const DAY_MS = 86_400_000;
 /** Incremental windows re-read this many days before the cursor. */
 const OVERLAP_DAYS = 10;
@@ -90,12 +90,6 @@ function optionalString(value: unknown, field: string, what = "transaction"): st
   if (value === undefined || value === null) return null;
   if (typeof value !== "string") throw new CliError(`API returned a ${what} with a non-string ${field}`);
   return value;
-}
-
-/** A calendar day `YYYY-MM-DD` that exists (so string order is date order). */
-function isCalendarDay(day: string): boolean {
-  const time = Date.parse(`${day}T00:00:00Z`);
-  return ISO_DAY.test(day) && Number.isFinite(time) && new Date(time).toISOString().startsWith(day);
 }
 
 function optionalDay(value: unknown, field: string, what = "transaction"): string | null {

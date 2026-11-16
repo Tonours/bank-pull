@@ -2,7 +2,8 @@ import { strict as assert } from "node:assert";
 import { chmodSync, mkdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { assertPrivate, ensurePrivateDir, ensurePrivateFile, loadConfig, readPrivateKey, resolvePaths } from "../src/config.js";
+import { assertPrivate, ensurePrivateDir, ensurePrivateFile, loadConfig, resolvePaths } from "../src/config.js";
+import { readPrivateKey } from "../src/jwt.js";
 import { CliError, ExitCode } from "../src/errors.js";
 import { tempHome } from "./support/tmp.js";
 

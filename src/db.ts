@@ -1,9 +1,11 @@
 import { closeSync, lstatSync, openSync, readSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { assertPrivate, ensurePrivateDir, ensurePrivateFile, rethrowDenied, type Paths } from "./config.js";
-import { CliError } from "./errors.js";
+import { CliError, ExitCode } from "./errors.js";
+import { hasUnsafeChars } from "./text.js";
 
-const MIGRATIONS: readonly string[] = [
+/** Exported for the migration test only. */
+export const MIGRATIONS: readonly string[] = [
   `
   CREATE TABLE accounts (
     id INTEGER PRIMARY KEY,
@@ -78,6 +80,33 @@ const MIGRATIONS: readonly string[] = [
     started_at TEXT NOT NULL
   ) STRICT;
   `,
+  /** 2: transaction ids are never reused (AUTOINCREMENT), so an id printed before a sync can never name another row. */
+  `
+  CREATE TABLE transactions_v2 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id),
+    dedup_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    booking_date TEXT,
+    value_date TEXT,
+    transaction_date TEXT,
+    amount_minor INTEGER NOT NULL,
+    currency TEXT NOT NULL,
+    credit_debit_indicator TEXT NOT NULL,
+    counterparty TEXT,
+    remittance TEXT,
+    entry_reference TEXT,
+    raw_json TEXT NOT NULL,
+    category TEXT,
+    note TEXT,
+    first_seen_at TEXT NOT NULL,
+    UNIQUE (account_id, dedup_key)
+  ) STRICT;
+  INSERT INTO transactions_v2 SELECT * FROM transactions;
+  DROP TABLE transactions;
+  ALTER TABLE transactions_v2 RENAME TO transactions;
+  CREATE INDEX transactions_account_date ON transactions (account_id, booking_date);
+  `,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
@@ -96,8 +125,10 @@ function migrate(db: DatabaseSync): void {
   try {
     const current = userVersion(db);
     if (current > SCHEMA_VERSION) throw tooNew(current);
-    for (let version = current; version < SCHEMA_VERSION; version++) db.exec(MIGRATIONS[version] ?? "");
-    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    if (current < SCHEMA_VERSION) {
+      for (let version = current; version < SCHEMA_VERSION; version++) db.exec(MIGRATIONS[version] ?? "");
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    }
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
@@ -261,4 +292,53 @@ export function syncStatus(db: DatabaseSync, now: Date): AccountStatus[] {
       warnings,
     };
   });
+}
+
+export const CATEGORY_MAX_LENGTH = 100;
+export const NOTE_MAX_LENGTH = 1000;
+
+export interface CategoryUpdate {
+  /** New category; the empty string clears it. Omitted keeps the current value. */
+  readonly category?: string;
+  /** New note; the empty string clears it. Omitted keeps the current value. */
+  readonly note?: string;
+}
+
+/** Category and note are shown in terminals and to agents: no control or bidi characters (the note may hold newlines and tabs). */
+function checkText(value: string | undefined, field: string, max: number, allowLines: boolean): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value.length > max) throw new CliError(`--${field} is longer than ${max} characters`, ExitCode.usage);
+  if (hasUnsafeChars(value, allowLines)) throw new CliError(`--${field} must not contain control characters`, ExitCode.usage);
+  return value === "" ? null : value;
+}
+
+/** Validates a categorize request before any database is opened; empty values become NULL. */
+export function checkCategoryUpdate(transactionId: number, update: CategoryUpdate): { category: string | null | undefined; note: string | null | undefined } {
+  if (!Number.isSafeInteger(transactionId) || transactionId < 1) throw new CliError("transaction id must be a positive integer", ExitCode.usage);
+  const category = checkText(update.category, "category", CATEGORY_MAX_LENGTH, false);
+  const note = checkText(update.note, "note", NOTE_MAX_LENGTH, true);
+  if (category === undefined && note === undefined) throw new CliError("give --category and/or --note (an empty value clears it)", ExitCode.usage);
+  return { category, note };
+}
+
+/**
+ * The one write outside sync, shared by CLI `categorize` and MCP `set_category`: a single fixed UPDATE that can
+ * only touch `category` and `note` of one transaction. Sync never writes these columns, so no sync lock is needed.
+ */
+export function setCategory(db: DatabaseSync, transactionId: number, update: CategoryUpdate): { id: number; category: string | null; note: string | null } {
+  const { category, note } = checkCategoryUpdate(transactionId, update);
+  const row = db
+    .prepare(
+      `UPDATE transactions SET category = iif(?1, ?2, category), note = iif(?3, ?4, note) WHERE id = ?5 AND status = 'BOOK'
+        RETURNING id, category, note`,
+    )
+    .get(category === undefined ? 0 : 1, category ?? null, note === undefined ? 0 : 1, note ?? null, transactionId) as
+    | { id: number; category: string | null; note: string | null }
+    | undefined;
+  if (row === undefined) {
+    const found = db.prepare("SELECT status FROM transactions WHERE id = ?").get(transactionId) as { status: string } | undefined;
+    if (found === undefined) throw new CliError(`no transaction with id ${transactionId} (see bank-pull transactions)`);
+    throw new CliError(`transaction ${transactionId} is not booked (${found.status}); pending rows are replaced on every sync, categorize it once booked`);
+  }
+  return row;
 }

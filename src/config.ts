@@ -1,6 +1,6 @@
 import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { CliError, ExitCode } from "./errors.js";
 
 export type Env = Readonly<Record<string, string | undefined>>;
@@ -117,7 +117,7 @@ export function ensurePrivateFile(path: string): void {
   assertPrivate(path, "file");
 }
 
-function readPrivate(path: string): string {
+export function readPrivate(path: string): string {
   try {
     return readFileSync(path, "utf8");
   } catch (error) {
@@ -156,13 +156,4 @@ export function loadConfig(paths: Paths): Config {
     keyPath: requireString(record, "keyPath", paths.configFile),
     redirectUrl,
   };
-}
-
-/** Reads the private key only after its file and directory pass the permission gate. */
-export function readPrivateKey(keyPath: string): string {
-  if (!isAbsolute(keyPath)) throw new CliError(`keyPath must be an absolute path (got "${keyPath}")`, ExitCode.usage);
-  const path = resolve(keyPath);
-  assertPrivate(dirname(path), "dir");
-  assertPrivate(path, "file");
-  return readPrivate(path);
 }

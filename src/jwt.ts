@@ -1,4 +1,7 @@
 import { createPrivateKey, sign, type KeyObject } from "node:crypto";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { assertPrivate, readPrivate } from "./config.js";
+import { CliError, ExitCode } from "./errors.js";
 
 /** Enable Banking accepts up to 86400 s; tokens are minted per request, so 300 s is plenty. */
 export const JWT_TTL_SECONDS = 300;
@@ -29,4 +32,13 @@ export function signJwt(appId: string, key: KeyObject, nowSeconds: number = Math
   );
   const input = `${header}.${payload}`;
   return `${input}.${base64url(sign("sha256", Buffer.from(input), key))}`;
+}
+
+/** Reads the private key only after its file and directory pass the permission gate. */
+export function readPrivateKey(keyPath: string): string {
+  if (!isAbsolute(keyPath)) throw new CliError(`keyPath must be an absolute path (got "${keyPath}")`, ExitCode.usage);
+  const path = resolve(keyPath);
+  assertPrivate(dirname(path), "dir");
+  assertPrivate(path, "file");
+  return readPrivate(path);
 }
