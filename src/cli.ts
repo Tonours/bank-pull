@@ -6,12 +6,12 @@ import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 import { parseArgs, type ParseArgsConfig } from "node:util";
 import { assertPrivate, ensurePrivateDir, loadConfig, readPrivateKey, resolvePaths, type Config, type Env, type Paths } from "./config.js";
-import { openReadWrite } from "./db.js";
+import { latestSession, openReadOnly, openReadWrite, syncStatus, type AccountStatus } from "./db.js";
 import { ApiError, DEFAULT_API_URL, EnableBankingClient } from "./enable-banking.js";
 import { CliError, ExitCode } from "./errors.js";
 import { loadSigningKey } from "./jwt.js";
 import { acquireLock, lockedWrite, releaseLock } from "./lock.js";
-import { backfillAccount, mapApiError, persistSession, type AccountResult, type SyncContext } from "./sync.js";
+import { backfillAccount, mapApiError, persistSession, syncAccount, type AccountResult, type SyncContext } from "./sync.js";
 
 export interface Io {
   readonly env: Env;
@@ -33,6 +33,8 @@ Commands:
                          open a bank consent, paste the redirect URL, then backfill
   revoke [--session <id>]
                          close the latest consent at the bank and forget it locally
+  sync [--json]          fetch new transactions and balances for every consented account
+  status [--json]        offline: cursor, consent expiry and history gaps per account
 
 Exit codes: 0 ok, 1 failure, 2 usage, 3 consent expired or closed,
 4 bank rate limit, 5 another sync running, 6 unsafe file permissions.
@@ -121,7 +123,7 @@ async function banks(args: readonly string[], paths: Paths, io: Io): Promise<num
   if (values.json === true) {
     io.stdout(`${JSON.stringify(list, null, 2)}\n`);
   } else {
-    for (const bank of list) io.stdout(`${bank.name}${bank.beta === true ? " (beta)" : ""}\n`);
+    for (const bank of list) io.stdout(`${printable(bank.name)}${bank.beta === true ? " (beta)" : ""}\n`);
   }
   return 0;
 }
@@ -156,11 +158,19 @@ export function consentValidUntil(now: Date, maximumSeconds: unknown): string {
   return new Date(now.getTime() + whole * 1000).toISOString();
 }
 
-function summarize(results: readonly AccountResult[], io: Io): void {
+/** Bank-controlled text is printed without control or bidi characters (no terminal escapes, no visually reordered line). */
+const printable = (text: string): string => text.replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "?");
+
+function summarize(results: readonly AccountResult[], statuses: readonly AccountStatus[], io: Io): void {
   for (const r of results) {
     const undated = r.skipped_undated > 0 ? `, ${r.skipped_undated} undated skipped` : "";
-    io.stdout(`${r.name}: backfill, ${r.received_book} booked received, ${r.inserted} new, ${r.pending} pending${undated}\n`);
+    io.stdout(`${printable(r.name)}: ${r.mode}, ${r.received_book} booked received, ${r.inserted} new, ${r.pending} pending${undated}\n`);
+    if (r.mode === "incremental") {
+      for (const row of r.inserted_rows) io.stdout(`  + ${row.date ?? "????-??-??"} ${row.amount} ${row.currency} ${printable(row.label || row.counterparty)}\n`);
+    }
     for (const gap of r.gaps_added) io.stdout(`  warning: history gap recorded (${gap.kind}); older history may be shorter than the bank's window\n`);
+    const permanent = statuses.find((s) => s.account_id === r.account_id)?.warnings ?? [];
+    for (const warning of [...r.warnings, ...permanent]) io.stdout(`  warning: ${warning}\n`);
   }
 }
 
@@ -197,11 +207,11 @@ async function auth(args: readonly string[], paths: Paths, io: Io): Promise<numb
       const session = await api.createSession(code);
       const ctx: SyncContext = { db, client: api, lockToken: token, now };
       const accounts = persistSession(ctx, session);
-      io.stderr(`consent stored (session ${session.session_id}, ${accounts.length} account(s), valid until ${session.access.valid_until})\n`);
+      io.stderr(printable(`consent stored (session ${session.session_id}, ${accounts.length} account(s), valid until ${session.access.valid_until})`) + "\n");
       const results: AccountResult[] = [];
       for (const acc of accounts) results.push(await backfillAccount(ctx, acc.id, acc.uid, acc.gaps));
       if (values.json === true) io.stdout(`${JSON.stringify({ session_id: session.session_id, accounts: results }, null, 2)}\n`);
-      else summarize(results, io);
+      else summarize(results, syncStatus(db, now), io);
       return 0;
     } finally {
       releaseLock(db, token);
@@ -232,10 +242,78 @@ async function revoke(args: readonly string[], paths: Paths, io: Io): Promise<nu
       note = `already ${error.code === "EXPIRED_SESSION" ? "expired" : "closed"} at the bank`;
     }
     lockedWrite(db, token, () => db.prepare("DELETE FROM sessions WHERE id = ?").run(row.id));
-    io.stdout(`revoked session ${row.id} (${note}); synced transactions stay in the database\n`);
+    io.stdout(`${printable(`revoked session ${row.id} (${note}); synced transactions stay in the database`)}\n`);
     return 0;
   } finally {
     if (token !== undefined) releaseLock(db, token);
+    db.close();
+  }
+}
+
+const expiredError = (accounts: number): CliError =>
+  new CliError(`bank consent expired for ${accounts} account(s); run "bank-pull auth" again`, ExitCode.consent);
+
+/**
+ * Syncs every account whose latest consent is still valid. Expired consents are reported (exit 3) without a request;
+ * any API error stops the run with its own exit code and no retry.
+ */
+async function sync(args: readonly string[], paths: Paths, io: Io): Promise<number> {
+  const values = parse(args, { json: { type: "boolean" } });
+  const api = client(loadConfig(paths), io.env);
+  const db = openReadWrite(paths);
+  try {
+    const now = io.now?.() ?? new Date();
+    // Consents are read under the lock, so a concurrent auth or revoke cannot hand this run a stale uid.
+    const token = acquireLock(db, now);
+    const results: AccountResult[] = [];
+    let expired = 0;
+    try {
+      const usable: { id: number; uid: string }[] = [];
+      for (const { id } of db.prepare("SELECT id FROM accounts ORDER BY id").all() as { id: number }[]) {
+        const consent = latestSession(db, id);
+        if (consent === undefined) continue;
+        if (Date.parse(consent.valid_until) > now.getTime()) usable.push({ id, uid: consent.uid });
+        else expired++;
+      }
+      if (usable.length === 0) throw expired > 0 ? expiredError(expired) : new CliError('no stored consent; run "bank-pull auth" first');
+      const ctx: SyncContext = { db, client: api, lockToken: token, now };
+      for (const acc of usable) results.push(await syncAccount(ctx, acc.id, acc.uid));
+    } finally {
+      releaseLock(db, token);
+    }
+    const statuses = syncStatus(db, now);
+    if (values.json === true) {
+      const accounts = results.map((r) => ({ ...r, warnings: [...r.warnings, ...(statuses.find((s) => s.account_id === r.account_id)?.warnings ?? [])] }));
+      io.stdout(`${JSON.stringify({ accounts }, null, 2)}\n`);
+    } else {
+      summarize(results, statuses, io);
+    }
+    if (expired === 0) return 0;
+    io.stderr(`bank-pull: ${expiredError(expired).message}\n`);
+    return ExitCode.consent;
+  } finally {
+    db.close();
+  }
+}
+
+/** Offline and read-only: needs neither the config nor the key, and never writes. */
+function status(args: readonly string[], paths: Paths, io: Io): number {
+  const values = parse(args, { json: { type: "boolean" } });
+  const db = openReadOnly(paths);
+  try {
+    const accounts = syncStatus(db, io.now?.() ?? new Date());
+    if (values.json === true) {
+      io.stdout(`${JSON.stringify({ accounts }, null, 2)}\n`);
+      return 0;
+    }
+    if (accounts.length === 0) io.stdout('no account yet; run "bank-pull auth"\n');
+    for (const a of accounts) {
+      const consent = a.consent_valid_until === null ? "no consent" : `consent until ${a.consent_valid_until.slice(0, 10)}`;
+      io.stdout(`${printable(a.name ?? `account ${a.account_id}`)} (${printable(a.bank)}): synced through ${a.synced_through ?? "never"}, ${a.booked} booked, ${a.pending} pending, ${consent}\n`);
+      for (const warning of a.warnings) io.stdout(`  warning: ${warning}\n`);
+    }
+    return 0;
+  } finally {
     db.close();
   }
 }
@@ -257,6 +335,10 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
         return await auth(rest, paths, io);
       case "revoke":
         return await revoke(rest, paths, io);
+      case "sync":
+        return await sync(rest, paths, io);
+      case "status":
+        return status(rest, paths, io);
       default:
         io.stderr(`bank-pull: unknown command "${command}"\n${USAGE}`);
         return ExitCode.usage;
@@ -264,7 +346,7 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
   } catch (error) {
     const mapped = mapApiError(error);
     if (mapped instanceof CliError) {
-      io.stderr(`bank-pull: ${mapped.message}\n`);
+      io.stderr(`bank-pull: ${printable(mapped.message)}\n`);
       return mapped.exitCode;
     }
     io.stderr(`bank-pull: ${(mapped as Error).stack ?? String(mapped)}\n`);

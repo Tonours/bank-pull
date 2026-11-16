@@ -230,8 +230,9 @@ export class EnableBankingClient {
     const balances = arrayField(body, "balances", what);
     const amountOk = (amount: unknown): boolean =>
       isObject(amount) && typeof amount["currency"] === "string" && typeof amount["amount"] === "string";
-    if (!balances.every((b) => typeof b["balance_type"] === "string" && amountOk(b["balance_amount"]))) {
-      throw malformed(what);
+    for (const b of balances) {
+      if (typeof b["balance_type"] !== "string") throw malformed(`${what} (balance_type)`);
+      if (!amountOk(b["balance_amount"])) throw malformed(`${what} (balance_amount)`);
     }
     return balances as unknown as readonly Balance[];
   }

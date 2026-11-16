@@ -26,3 +26,12 @@ export function toMinorUnits(amount: string, currency: string, indicator: string
   return indicator === "DBIT" && value !== 0 ? -value : value;
 }
 
+
+/** Signed integer minor units back to a decimal string (`-1230` EUR -> `"-12.30"`), for display and JSON. */
+export function formatMinor(minor: number, currency: string): string {
+  const exponent = currencyExponent(currency);
+  const digits = Math.abs(minor).toString().padStart(exponent + 1, "0");
+  const integer = digits.slice(0, digits.length - exponent);
+  const fraction = exponent > 0 ? `.${digits.slice(digits.length - exponent)}` : "";
+  return `${minor < 0 ? "-" : ""}${integer}${fraction}`;
+}

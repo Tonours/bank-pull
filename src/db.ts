@@ -170,3 +170,95 @@ export function openReadOnly(paths: Paths): DatabaseSync {
   }
   return db;
 }
+
+/** An append-only entry of `accounts.history_gaps`: history in or before this range may be incomplete. */
+export type Gap =
+  | { readonly kind: "interrupted-backfill"; readonly recorded_at: string }
+  | { readonly kind: "unserved-window"; readonly from: string; readonly to: string; readonly recorded_at: string };
+
+export const CONSENT_WARNING_DAYS = 14;
+const DAY_MS = 86_400_000;
+
+export interface AccountStatus {
+  readonly account_id: number;
+  readonly name: string | null;
+  readonly bank: string;
+  readonly synced_through: string | null;
+  readonly backfill_done: boolean;
+  readonly covered_from: string | null;
+  readonly booked: number;
+  readonly pending: number;
+  readonly skipped_undated: number;
+  readonly history_gaps: readonly Gap[];
+  readonly consent_valid_until: string | null;
+  readonly consent_days_left: number | null;
+  readonly warnings: readonly string[];
+}
+
+/** Latest consent of an account (revoked sessions are deleted), or undefined. */
+export function latestSession(db: DatabaseSync, accountId: number): { id: string; uid: string; valid_until: string } | undefined {
+  return db
+    .prepare(
+      `SELECT s.id, sa.uid, s.valid_until FROM sessions s JOIN session_accounts sa ON sa.session_id = s.id
+        WHERE sa.account_id = ? ORDER BY s.created_at DESC, s.rowid DESC LIMIT 1`,
+    )
+    .get(accountId) as { id: string; uid: string; valid_until: string } | undefined;
+}
+
+/** Offline sync health per account: cursor, consent expiry, gaps. Read-only; shared by CLI `status`, `sync` and MCP `sync_status`. */
+export function syncStatus(db: DatabaseSync, now: Date): AccountStatus[] {
+  const rows = db
+    .prepare(
+      `SELECT a.id, a.name, a.aspsp_name, a.aspsp_country, a.synced_through, a.backfill_done, a.covered_from,
+              a.skipped_undated, a.history_gaps,
+              (SELECT count(*) FROM transactions t WHERE t.account_id = a.id AND t.status = 'BOOK') AS booked,
+              (SELECT count(*) FROM transactions t WHERE t.account_id = a.id AND t.status != 'BOOK') AS pending
+         FROM accounts a ORDER BY a.id`,
+    )
+    .all() as {
+    id: number;
+    name: string | null;
+    aspsp_name: string;
+    aspsp_country: string;
+    synced_through: string | null;
+    backfill_done: number;
+    covered_from: string | null;
+    skipped_undated: number;
+    history_gaps: string;
+    booked: number;
+    pending: number;
+  }[];
+  return rows.map((row) => {
+    const gaps = JSON.parse(row.history_gaps) as Gap[];
+    const validUntil = latestSession(db, row.id)?.valid_until ?? null;
+    const warnings: string[] = [];
+    const daysLeft = validUntil === null ? null : Math.floor((Date.parse(validUntil) - now.getTime()) / DAY_MS);
+    if (validUntil === null) warnings.push('no active consent; run "bank-pull auth"');
+    else if (Date.parse(validUntil) <= now.getTime()) warnings.push('consent expired; run "bank-pull auth"');
+    else if (daysLeft !== null && daysLeft < CONSENT_WARNING_DAYS) warnings.push(`consent expires in ${daysLeft} day(s); run "bank-pull auth" soon`);
+    if (row.backfill_done !== 1) warnings.push('initial backfill not complete; run "bank-pull sync"');
+    for (const gap of gaps) {
+      warnings.push(
+        gap.kind === "interrupted-backfill"
+          ? `an initial backfill was interrupted; history before ${row.covered_from ?? "the first booked row"} may be shorter than the bank's initial window`
+          : `history gap: booked transactions between ${gap.from} and ${gap.to} may be missing`,
+      );
+    }
+    if (row.skipped_undated > 0) warnings.push(`${row.skipped_undated} booked row(s) without any date or reference were skipped`);
+    return {
+      account_id: row.id,
+      name: row.name,
+      bank: `${row.aspsp_name} (${row.aspsp_country})`,
+      synced_through: row.synced_through,
+      backfill_done: row.backfill_done === 1,
+      covered_from: row.covered_from,
+      booked: Number(row.booked),
+      pending: Number(row.pending),
+      skipped_undated: row.skipped_undated,
+      history_gaps: gaps,
+      consent_valid_until: validUntil,
+      consent_days_left: daysLeft,
+      warnings,
+    };
+  });
+}

@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { toMinorUnits } from "./amount.js";
-import { ApiError, type EnableBankingClient, type Session, type Transaction, type TransactionQuery } from "./enable-banking.js";
+import { formatMinor, toMinorUnits } from "./amount.js";
+import type { Gap } from "./db.js";
+import { ApiError, type Balance, type EnableBankingClient, type Session, type Transaction, type TransactionQuery } from "./enable-banking.js";
 import { CliError, ExitCode } from "./errors.js";
 import { lockedWrite } from "./lock.js";
 
@@ -9,20 +10,34 @@ const MAX_PAGES = 10_000;
 /** Cancelled and rejected rows are never stored; every other non-BOOK status is part of the pending snapshot. */
 const DROPPED = new Set(["CNCL", "RJCT"]);
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+const DAY_MS = 86_400_000;
+/** Incremental windows re-read this many days before the cursor. */
+const OVERLAP_DAYS = 10;
+/** A stored pending row pulls the window back at most this far. */
+const PENDING_REACH_DAYS = 90;
+/** Past this downtime the bank may no longer serve date_from: ask for strategy=longest and record a gap. */
+const LONG_DOWNTIME_DAYS = 80;
 
-export interface Gap {
-  readonly kind: "interrupted-backfill";
-  readonly recorded_at: string;
+export interface InsertedRow {
+  readonly date: string | null;
+  readonly amount: string;
+  readonly amount_minor: number;
+  readonly currency: string;
+  readonly label: string;
+  readonly counterparty: string;
 }
 
 export interface AccountResult {
   readonly account_id: number;
   readonly name: string;
+  readonly mode: "backfill" | "incremental";
   readonly received_book: number;
   readonly inserted: number;
+  readonly inserted_rows: readonly InsertedRow[];
   readonly pending: number;
   readonly skipped_undated: number;
   readonly gaps_added: readonly Gap[];
+  readonly warnings: readonly string[];
 }
 
 export interface SyncContext {
@@ -36,6 +51,7 @@ interface AccountState {
   readonly id: number;
   readonly name: string | null;
   readonly identification_hash: string;
+  readonly synced_through: string | null;
   readonly backfill_started: number;
   readonly backfill_done: number;
   readonly covered_from: string | null;
@@ -45,6 +61,12 @@ interface AccountState {
 export function isoDate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
+
+export function addDays(day: string, days: number): string {
+  return isoDate(new Date(Date.parse(`${day}T00:00:00Z`) + days * DAY_MS));
+}
+
+const daysBetween = (from: string, to: string): number => Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / DAY_MS);
 
 const minDate = (a: string | null, b: string | null): string | null => (a === null ? b : b === null ? a : a < b ? a : b);
 
@@ -64,9 +86,9 @@ export function mapApiError(error: unknown): unknown {
 }
 
 /** API fields are untrusted: anything but a string (or absent/null) fails the run with the field named. */
-function optionalString(value: unknown, field: string): string | null {
+function optionalString(value: unknown, field: string, what = "transaction"): string | null {
   if (value === undefined || value === null) return null;
-  if (typeof value !== "string") throw new CliError(`API returned a transaction with a non-string ${field}`);
+  if (typeof value !== "string") throw new CliError(`API returned a ${what} with a non-string ${field}`);
   return value;
 }
 
@@ -76,10 +98,10 @@ function isCalendarDay(day: string): boolean {
   return ISO_DAY.test(day) && Number.isFinite(time) && new Date(time).toISOString().startsWith(day);
 }
 
-function optionalDay(value: unknown, field: string): string | null {
-  const day = optionalString(value, field);
+function optionalDay(value: unknown, field: string, what = "transaction"): string | null {
+  const day = optionalString(value, field, what);
   if (day !== null && !isCalendarDay(day)) {
-    throw new CliError(`API returned a transaction with an invalid ${field}: ${JSON.stringify(day)}`);
+    throw new CliError(`API returned a ${what} with an invalid ${field}: ${JSON.stringify(day)}`);
   }
   return day;
 }
@@ -156,8 +178,9 @@ const sha = (value: string): string => createHash("sha256").update(value).digest
 class Run {
   readonly #occurrences = new Map<string, number>();
   readonly pending: Row[] = [];
+  /** Pages stored so far; a retry is only safe while this is 0. */
+  pages = 0;
   receivedBook = 0;
-  inserted = 0;
   skippedUndated = 0;
   earliestBook: string | null = null;
 
@@ -198,8 +221,14 @@ function insertRow(db: DatabaseSync, accountId: number, key: string, row: Row, n
  * Follows continuation_key to the end with the same query. BOOK rows of each page are committed as the page
  * arrives (kept on a later failure); non-final rows are only collected, for the caller to commit as a snapshot.
  */
-async function fetchRun(ctx: SyncContext, accountId: number, uid: string, query: TransactionQuery): Promise<Run> {
-  const run = new Run();
+async function fetchRun(
+  ctx: SyncContext,
+  accountId: number,
+  uid: string,
+  query: TransactionQuery,
+  inserted: InsertedRow[],
+  run = new Run(),
+): Promise<Run> {
   const seenKeys = new Set<string>();
   let continuation: string | undefined;
   for (let page = 0; ; page++) {
@@ -217,12 +246,13 @@ async function fetchRun(ctx: SyncContext, accountId: number, uid: string, query:
             continue;
           }
           run.earliestBook = minDate(run.earliestBook, row.day);
-          if (insertRow(ctx.db, accountId, run.keyFor(row.material, ""), row, ctx.now)) run.inserted++;
+          if (insertRow(ctx.db, accountId, run.keyFor(row.material, ""), row, ctx.now)) inserted.push(describe(row));
         } else if (!DROPPED.has(row.status)) {
           run.pending.push(row);
         }
       }
     });
+    run.pages++;
     if (next === null) return run;
     seenKeys.add(next);
     continuation = next;
@@ -258,32 +288,165 @@ function replacePending(ctx: SyncContext, accountId: number, run: Run): void {
   for (const row of run.pending) insertRow(ctx.db, accountId, local.keyFor(row.material, "p:"), row, ctx.now);
 }
 
-/** Full-history fetch with strategy=longest. The caller has already run openBackfill for this attempt. */
-export async function backfillAccount(ctx: SyncContext, accountId: number, uid: string, openedGaps: readonly Gap[]): Promise<AccountResult> {
-  const today = isoDate(ctx.now);
-  let run: Run;
+interface StoredBalance {
+  readonly balance_type: string;
+  readonly currency: string;
+  readonly amount_minor: number;
+  readonly reference_date: string | null;
+}
+
+/** Balance fields are untrusted too; the sign of a balance is carried by its amount string. */
+function normalizeBalance(balance: Balance): StoredBalance {
+  if (balance.balance_type === "") throw new CliError("API returned a balance with an empty balance_type");
+  const { amount, currency } = balance.balance_amount;
+  let amountMinor: number;
   try {
-    run = await fetchRun(ctx, accountId, uid, { strategy: "longest", date_to: today });
+    amountMinor = toMinorUnits(amount, currency, amount.startsWith("-") ? "DBIT" : "CRDT");
   } catch (error) {
-    throw mapApiError(error);
+    throw new CliError(`balance_amount: ${(error as Error).message}`);
   }
+  return {
+    balance_type: balance.balance_type,
+    currency,
+    amount_minor: amountMinor,
+    reference_date: optionalDay(balance.reference_date, "reference_date", "balance"),
+  };
+}
+
+function describe(row: Row): InsertedRow {
+  return {
+    date: row.day,
+    amount: formatMinor(row.amount_minor, row.currency),
+    amount_minor: row.amount_minor,
+    currency: row.currency,
+    label: row.remittance,
+    counterparty: row.counterparty,
+  };
+}
+
+interface Completion {
+  readonly mode: AccountResult["mode"];
+  /** Gaps to report; in backfill mode openBackfill has already stored them, incremental gaps are stored here. */
+  readonly gaps: readonly Gap[];
+  readonly warnings: readonly string[];
+}
+
+/**
+ * After the last page: fetch balances, then in one locked transaction replace the pending snapshot and the
+ * balances, advance the cursor and append gaps. A failed or malformed balances answer does not undo the complete
+ * transaction fetch: the snapshot and cursor are committed with the previous balances kept, then the error is raised
+ * (incremental sync) or reported as a warning (backfill, so `auth` completes).
+ */
+async function complete(ctx: SyncContext, accountId: number, uid: string, run: Run, inserted: readonly InsertedRow[], done: Completion): Promise<AccountResult> {
+  let balances: StoredBalance[] | undefined;
+  let balanceError: unknown;
+  try {
+    balances = (await ctx.client.getBalances(uid)).map(normalizeBalance);
+  } catch (error) {
+    balanceError = mapApiError(error);
+  }
+  const today = isoDate(ctx.now);
   const state = lockedWrite(ctx.db, ctx.lockToken, () => {
     replacePending(ctx, accountId, run);
+    if (balances !== undefined) {
+      ctx.db.prepare("DELETE FROM balances WHERE account_id = ?").run(accountId);
+      const insertBalance = ctx.db.prepare(
+        "INSERT OR REPLACE INTO balances (account_id, balance_type, currency, amount_minor, reference_date, fetched_at) VALUES (?, ?, ?, ?, ?, ?)",
+      );
+      for (const b of balances) insertBalance.run(accountId, b.balance_type, b.currency, b.amount_minor, b.reference_date, ctx.now.toISOString());
+    }
     const before = account(ctx.db, accountId);
+    const gaps = [...(JSON.parse(before.history_gaps) as Gap[]), ...(done.mode === "incremental" ? done.gaps : [])];
+    const coveredFrom = done.mode === "backfill" ? minDate(before.covered_from, run.earliestBook) : before.covered_from;
     ctx.db
-      .prepare("UPDATE accounts SET backfill_done = 1, synced_through = ?, covered_from = ?, skipped_undated = skipped_undated + ? WHERE id = ?")
-      .run(today, minDate(before.covered_from, run.earliestBook), run.skippedUndated, accountId);
+      .prepare(
+        `UPDATE accounts SET backfill_done = CASE WHEN ? THEN 1 ELSE backfill_done END, synced_through = ?, covered_from = ?,
+           skipped_undated = skipped_undated + ?, history_gaps = ? WHERE id = ?`,
+      )
+      .run(done.mode === "backfill" ? 1 : 0, today, coveredFrom, run.skippedUndated, JSON.stringify(gaps), accountId);
     return before;
   });
+  // During auth the consent and every booked row are already stored: a bank without a usable balances endpoint must
+  // not fail the consent flow, so the backfill reports it as a warning. Incremental sync still fails the run.
+  const warnings = [...done.warnings];
+  if (balanceError !== undefined) {
+    if (done.mode !== "backfill") throw balanceError;
+    warnings.push(`balances not stored: ${balanceError instanceof Error ? balanceError.message : String(balanceError)}`);
+  }
   return {
     account_id: state.id,
     name: state.name ?? state.identification_hash.slice(0, 12),
+    mode: done.mode,
     received_book: run.receivedBook,
-    inserted: run.inserted,
+    inserted: inserted.length,
+    inserted_rows: inserted,
     pending: run.pending.length,
     skipped_undated: run.skippedUndated,
-    gaps_added: openedGaps,
+    gaps_added: done.gaps,
+    warnings,
   };
+}
+
+/** Full-history fetch with strategy=longest. The caller has already run openBackfill for this attempt. */
+export async function backfillAccount(ctx: SyncContext, accountId: number, uid: string, openedGaps: readonly Gap[]): Promise<AccountResult> {
+  const inserted: InsertedRow[] = [];
+  let run: Run;
+  try {
+    run = await fetchRun(ctx, accountId, uid, { strategy: "longest", date_to: isoDate(ctx.now) }, inserted);
+  } catch (error) {
+    throw mapApiError(error);
+  }
+  return complete(ctx, accountId, uid, run, inserted, { mode: "backfill", gaps: openedGaps, warnings: [] });
+}
+
+/**
+ * One account of `sync`: reruns the backfill while it is unfinished; otherwise fetches from
+ * min(synced_through - 10 days, oldest stored dated pending row capped at 90 days) to today.
+ * Past 80 days of downtime it asks for strategy=longest; a WRONG_TRANSACTIONS_PERIOD answer gets exactly one retry
+ * without date_from. Both cases append an unserved-window gap from synced_through to the earliest booked row received.
+ */
+export async function syncAccount(ctx: SyncContext, accountId: number, uid: string): Promise<AccountResult> {
+  const state = account(ctx.db, accountId);
+  const through = state.synced_through;
+  if (state.backfill_done !== 1 || through === null) {
+    const gaps = lockedWrite(ctx.db, ctx.lockToken, () => openBackfill(ctx.db, accountId, ctx.now));
+    return backfillAccount(ctx, accountId, uid, gaps);
+  }
+  const today = isoDate(ctx.now);
+  const warnings: string[] = [];
+  const oldest = ctx.db
+    .prepare("SELECT min(coalesce(booking_date, value_date, transaction_date)) AS day FROM transactions WHERE account_id = ? AND status != 'BOOK'")
+    .get(accountId) as { day: string | null };
+  const cap = addDays(today, -PENDING_REACH_DAYS);
+  if (oldest.day !== null && oldest.day < cap) {
+    warnings.push(`pending rows dated before ${cap} are outside the sync window and are dropped unless the bank still returns them`);
+  }
+  const pendingFrom = oldest.day === null ? null : oldest.day < cap ? cap : oldest.day;
+  const dateFrom = minDate(minDate(addDays(through, -OVERLAP_DAYS), pendingFrom), today) ?? today;
+  const longDowntime = daysBetween(through, today) > LONG_DOWNTIME_DAYS;
+  const query: TransactionQuery = longDowntime ? { date_from: dateFrom, date_to: today, strategy: "longest" } : { date_from: dateFrom, date_to: today };
+  if (longDowntime) warnings.push(`last complete sync was ${through}; the bank may no longer serve all of that period`);
+  const inserted: InsertedRow[] = [];
+  let recovered = longDowntime;
+  const first = new Run();
+  let run: Run;
+  try {
+    try {
+      run = await fetchRun(ctx, accountId, uid, query, inserted, first);
+    } catch (error) {
+      // Only a refusal of the first request is a refused window; later pages already stored rows of this run.
+      if (first.pages > 0 || !(error instanceof ApiError && error.code === "WRONG_TRANSACTIONS_PERIOD")) throw error;
+      recovered = true;
+      warnings.push(`the bank refused date_from ${dateFrom} (WRONG_TRANSACTIONS_PERIOD); retried once without it`);
+      run = await fetchRun(ctx, accountId, uid, { date_to: today, strategy: "longest" }, inserted);
+    }
+  } catch (error) {
+    throw mapApiError(error);
+  }
+  // An empty interval (the recovery reached back to the cursor) is no gap.
+  const reached = run.earliestBook ?? today;
+  const gaps: Gap[] = recovered && reached > through ? [{ kind: "unserved-window", from: through, to: reached, recorded_at: ctx.now.toISOString() }] : [];
+  return complete(ctx, accountId, uid, run, inserted, { mode: "incremental", gaps, warnings });
 }
 
 /** Account fields are untrusted: absent/null is stored as NULL, any other non-string refuses the session. */

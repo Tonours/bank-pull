@@ -27,6 +27,12 @@ export interface FakeState {
   failPath: Map<string, FakeError>;
   /** Answers every request whose path starts with the key with this raw body (malformed-response tests). */
   rawPath: Map<string, { readonly status: number; readonly body: string; readonly headers?: Readonly<Record<string, string>> }>;
+  /** Never answers the n-th (1-based) transactions request of an account (SIGKILL tests). */
+  hangTransactions: Map<string, number>;
+  /** When true, served rows are filtered by date_from/date_to on their first date (undated rows always pass). */
+  filterDates: boolean;
+  /** Oldest day the bank still serves: an earlier date_from gets 422 WRONG_TRANSACTIONS_PERIOD, older rows are not served. */
+  oldestServed: string | undefined;
   authStates: string[];
   deletedSessions: string[];
 }
@@ -85,6 +91,9 @@ export async function startFakeApi(appId: string, publicKeyPem: string): Promise
     failTransactions: new Map(),
     failPath: new Map(),
     rawPath: new Map(),
+    hangTransactions: new Map(),
+    filterDates: false,
+    oldestServed: undefined,
     authStates: [],
     deletedSessions: [],
   };
@@ -146,6 +155,11 @@ export async function startFakeApi(appId: string, publicKeyPem: string): Promise
         transactionRequests.set(account, count);
         const failure = state.failTransactions.get(account);
         if (failure !== undefined && failure.atRequest === count) return fail(res, failure.error);
+        if (state.hangTransactions.get(account) === count) return;
+        const from = query["date_from"];
+        if (from !== undefined && state.oldestServed !== undefined && from < state.oldestServed) {
+          return json(res, 422, { error: "WRONG_TRANSACTIONS_PERIOD", message: "date_from too old" });
+        }
         const { continuation_key: key, ...rest } = query;
         const params = JSON.stringify(Object.entries(rest).sort());
         let page = 0;
@@ -156,7 +170,14 @@ export async function startFakeApi(appId: string, publicKeyPem: string): Promise
           page = previous.page + 1;
         }
         const pages = state.pages.get(account) ?? [[]];
-        const transactions = pages[page] ?? [];
+        const day = (t: Transaction): string | null | undefined => t.booking_date ?? t.value_date ?? t.transaction_date;
+        const inWindow = (t: Transaction): boolean => {
+          const d = day(t);
+          if (d === null || d === undefined) return true;
+          if (state.oldestServed !== undefined && d < state.oldestServed) return false;
+          return !state.filterDates || ((from === undefined || d >= from) && (query["date_to"] === undefined || d <= query["date_to"]));
+        };
+        const transactions = (pages[page] ?? []).filter(inWindow);
         let continuation: string | null = null;
         if (page + 1 < pages.length) {
           continuation = `ck-${nextKey++}`;
@@ -173,6 +194,10 @@ export async function startFakeApi(appId: string, publicKeyPem: string): Promise
     url: `http://127.0.0.1:${port}`,
     state,
     requests,
-    close: () => new Promise((resolve) => server.close(() => resolve())),
+    close: () =>
+      new Promise((resolve) => {
+        server.close(() => resolve());
+        server.closeAllConnections();
+      }),
   };
 }
