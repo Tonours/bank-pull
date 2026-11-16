@@ -8,6 +8,7 @@ import { MIGRATIONS, openReadWrite } from "../src/db.js";
 import { assertSingleStatement, guardedQuery, searchTransactions, type TransactionView } from "../src/read.js";
 import { BANK, install, session, tx } from "./support/fixtures.js";
 import { callback, harness, type CliRun, type Harness } from "./support/harness.js";
+import { refusedSql } from "./support/sql-escapes.js";
 import { tempHome } from "./support/tmp.js";
 
 const NOW = new Date("2026-11-15T09:00:00.000Z");
@@ -189,31 +190,7 @@ test("AC-8: query runs one read-only SELECT or WITH, capped by --max-rows", asyn
 test("AC-8: query refuses writes, ATTACH, VACUUM INTO, temp tables, PRAGMA and a second statement; DB bytes and data dir unchanged", async () => {
   const hash = dbHash();
   const files = readdirSync(h.paths.dataDir).sort();
-  for (const sql of [
-    "DELETE FROM transactions",
-    "UPDATE transactions SET category = 'x'",
-    "INSERT INTO sync_lock VALUES (1, 1, 't', 'now')",
-    "ATTACH DATABASE ':memory:' AS m",
-    `ATTACH DATABASE '${h.paths.dataDir}/evil.db' AS m`,
-    `VACUUM INTO '${h.paths.dataDir}/copy.db'`,
-    "VACUUM",
-    "CREATE TEMP TABLE t (x)",
-    "CREATE TEMP VIEW v AS SELECT 1",
-    "PRAGMA writable_schema = 1",
-    "PRAGMA user_version = 99",
-    "PRAGMA table_info(transactions)",
-    "SELECT * FROM pragma_table_info('transactions')",
-    "SELECT load_extension('/tmp/x')",
-    "SELECT 1; DELETE FROM transactions",
-    "SELECT 1;DELETE FROM transactions",
-    "SELECT 1; /* c */ ATTACH ':memory:' AS m",
-    "SELECT ';'; SELECT 2",
-    "SELECT \"a;\"\"\" FROM (SELECT 1 AS \"a;\"\"\"); SELECT 2",
-    "SELECT [x;] FROM (SELECT 1 AS [x;]); SELECT 2",
-    "BEGIN",
-    "   ",
-    "-- only a comment",
-  ]) {
+  for (const sql of refusedSql(h.paths.dataDir)) {
     const run = await h.run(["query", "--", sql]);
     assert.notEqual(run.code, 0, `${sql} was accepted: ${run.stdout}`);
     assert.match(run.stderr, /query|statement/, sql);
@@ -294,7 +271,7 @@ test("transaction ids are never reused, migration 2 keeps every row, and amount 
   }
 });
 
-test("categorize validates its arguments before opening (and migrating) the database", async () => {
+test("categorize validates its arguments first and never migrates an older database", async () => {
   const { env, paths } = tempHome();
   mkdirSync(paths.dataDir, { mode: 0o700 });
   const v1 = new DatabaseSync(paths.dbFile);
@@ -306,6 +283,8 @@ test("categorize validates its arguments before opening (and migrating) the data
   const io = { env, stdout: () => undefined, stderr: (t: string) => void (stderr += t), readLine: () => Promise.reject(new Error("no prompt")) };
   assert.equal(await main(["categorize", "--id", "1", "--category", "x".repeat(101)], io), ExitCode.usage);
   assert.match(stderr, /longer than 100/);
+  assert.equal(await main(["categorize", "--id", "1", "--category", "x"], io), ExitCode.failure);
+  assert.match(stderr, /schema version 1, expected 2; run "bank-pull sync" to migrate/);
   const db = new DatabaseSync(paths.dbFile, { readOnly: true });
   try {
     assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 1);

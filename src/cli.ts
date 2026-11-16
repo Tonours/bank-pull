@@ -3,11 +3,10 @@ import { randomUUID } from "node:crypto";
 import { realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
-import type { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import { parseArgs, type ParseArgsConfig } from "node:util";
 import { assertPrivate, ensurePrivateDir, loadConfig, resolvePaths, type Config, type Env, type Paths } from "./config.js";
-import { checkCategoryUpdate, latestSession, openReadOnly, openReadWrite, setCategory, syncStatus, type AccountStatus } from "./db.js";
+import { categorize, latestSession, openReadWrite, syncStatus, withReadOnly, type AccountStatus } from "./db.js";
 import { ApiError, DEFAULT_API_URL, EnableBankingClient } from "./enable-banking.js";
 import { CliError, ExitCode } from "./errors.js";
 import { loadSigningKey, readPrivateKey } from "./jwt.js";
@@ -48,6 +47,7 @@ Commands:
                          offline: one read-only SQL statement (default 500 rows, max 5000)
   categorize --id <n> [--category <c>] [--note <text>] [--json]
                          set the category and/or note of one booked transaction (empty value clears)
+  mcp                    offline stdio MCP server over the local database (no network, no key)
 
 Exit codes: 0 ok, 1 failure, 2 usage, 3 consent expired or closed,
 4 bank rate limit, 5 another sync running, 6 unsafe file permissions.
@@ -309,32 +309,15 @@ async function sync(args: readonly string[], paths: Paths, io: Io): Promise<numb
 /** Offline and read-only: needs neither the config nor the key, and never writes. */
 function status(args: readonly string[], paths: Paths, io: Io): number {
   const values = parse(args, { json: { type: "boolean" } });
-  const db = openReadOnly(paths);
-  try {
-    const accounts = syncStatus(db, io.now?.() ?? new Date());
-    if (values.json === true) {
-      io.stdout(`${JSON.stringify({ accounts }, null, 2)}\n`);
-      return 0;
-    }
-    if (accounts.length === 0) io.stdout('no account yet; run "bank-pull auth"\n');
-    for (const a of accounts) {
-      const consent = a.consent_valid_until === null ? "no consent" : `consent until ${a.consent_valid_until.slice(0, 10)}`;
-      io.stdout(`${printable(a.name ?? `account ${a.account_id}`)} (${printable(a.bank)}): synced through ${a.synced_through ?? "never"}, ${a.booked} booked, ${a.pending} pending, ${consent}\n`);
-      for (const warning of a.warnings) io.stdout(`  warning: ${warning}\n`);
-    }
-    return 0;
-  } finally {
-    db.close();
+  const accounts = withReadOnly(paths, (db) => syncStatus(db, io.now?.() ?? new Date()));
+  if (values.json === true) return json(io, { accounts });
+  if (accounts.length === 0) io.stdout('no account yet; run "bank-pull auth"\n');
+  for (const a of accounts) {
+    const consent = a.consent_valid_until === null ? "no consent" : `consent until ${a.consent_valid_until.slice(0, 10)}`;
+    io.stdout(`${printable(a.name ?? `account ${a.account_id}`)} (${printable(a.bank)}): synced through ${a.synced_through ?? "never"}, ${a.booked} booked, ${a.pending} pending, ${consent}\n`);
+    for (const warning of a.warnings) io.stdout(`  warning: ${warning}\n`);
   }
-}
-
-function withReadOnly<T>(paths: Paths, fn: (db: DatabaseSync) => T): T {
-  const db = openReadOnly(paths);
-  try {
-    return fn(db);
-  } finally {
-    db.close();
-  }
+  return 0;
 }
 
 function json(io: Io, value: unknown): number {
@@ -426,23 +409,14 @@ function query(args: readonly string[], paths: Paths, io: Io): number {
 }
 
 /** The only write besides sync: sets or clears the category and note of one existing transaction; never creates the DB. */
-function categorize(args: readonly string[], paths: Paths, io: Io): number {
+function categorizeCommand(args: readonly string[], paths: Paths, io: Io): number {
   const values = parse(args, { id: { type: "string" }, category: { type: "string" }, note: { type: "string" }, json: { type: "boolean" } });
   const id = integer(values.id, "id");
   if (id === undefined) throw new CliError("missing --id (see bank-pull transactions)", ExitCode.usage);
-  const update = { category: text(values.category), note: text(values.note) };
-  checkCategoryUpdate(id, update);
-  assertPrivate(paths.dataDir, "dir");
-  assertPrivate(paths.dbFile, "file");
-  const db = openReadWrite(paths);
-  try {
-    const row = setCategory(db, id, update);
-    if (values.json === true) return json(io, row);
-    io.stdout(`${printable(`#${row.id} category ${row.category ?? "(none)"}, note ${row.note ?? "(none)"}`)}\n`);
-    return 0;
-  } finally {
-    db.close();
-  }
+  const row = categorize(paths, id, { category: text(values.category), note: text(values.note) });
+  if (values.json === true) return json(io, row);
+  io.stdout(`${printable(`#${row.id} category ${row.category ?? "(none)"}, note ${row.note ?? "(none)"}`)}\n`);
+  return 0;
 }
 
 export async function main(argv: readonly string[], io: Io): Promise<number> {
@@ -473,7 +447,13 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
       case "query":
         return query(rest, paths, io);
       case "categorize":
-        return categorize(rest, paths, io);
+        return categorizeCommand(rest, paths, io);
+      case "mcp": {
+        parse(rest, {});
+        const { serveStdio } = await import("./mcp.js");
+        await serveStdio(paths);
+        return 0;
+      }
       default:
         io.stderr(`bank-pull: unknown command "${command}"\n${USAGE}`);
         return ExitCode.usage;

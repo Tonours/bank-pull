@@ -179,15 +179,15 @@ function isWalFormat(dbFile: string): boolean {
   }
 }
 
-/** Opens an existing database read-only; never creates or migrates anything. */
-export function openReadOnly(paths: Paths): DatabaseSync {
+/** Opens an existing database at the current schema; never creates or migrates anything. */
+function openExisting(paths: Paths, readOnly: boolean): DatabaseSync {
   assertPrivate(paths.dataDir, "dir");
   assertPrivate(paths.dbFile, "file");
   assertSidecarsPrivate(paths.dbFile);
   if (isWalFormat(paths.dbFile)) {
     throw new CliError(`${paths.dbFile} is in WAL mode; run "bank-pull sync" once to convert it`);
   }
-  const db = new DatabaseSync(paths.dbFile, { readOnly: true });
+  const db = new DatabaseSync(paths.dbFile, { readOnly });
   try {
     db.exec("PRAGMA busy_timeout = 5000");
     const version = userVersion(db);
@@ -200,6 +200,18 @@ export function openReadOnly(paths: Paths): DatabaseSync {
     throw error;
   }
   return db;
+}
+
+export const openReadOnly = (paths: Paths): DatabaseSync => openExisting(paths, true);
+
+/** Runs `fn` on a read-only connection, closed afterwards. */
+export function withReadOnly<T>(paths: Paths, fn: (db: DatabaseSync) => T): T {
+  const db = openReadOnly(paths);
+  try {
+    return fn(db);
+  } finally {
+    db.close();
+  }
 }
 
 /** An append-only entry of `accounts.history_gaps`: history in or before this range may be incomplete. */
@@ -341,4 +353,18 @@ export function setCategory(db: DatabaseSync, transactionId: number, update: Cat
     throw new CliError(`transaction ${transactionId} is not booked (${found.status}); pending rows are replaced on every sync, categorize it once booked`);
   }
   return row;
+}
+
+/**
+ * CLI `categorize` and MCP `set_category`: validates first, then writes through `setCategory` on an existing
+ * database at the current schema. It never creates the database and never migrates it (that is sync's job).
+ */
+export function categorize(paths: Paths, transactionId: number, update: CategoryUpdate): { id: number; category: string | null; note: string | null } {
+  checkCategoryUpdate(transactionId, update);
+  const db = openExisting(paths, false);
+  try {
+    return setCategory(db, transactionId, update);
+  } finally {
+    db.close();
+  }
 }
