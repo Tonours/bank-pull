@@ -1,0 +1,17 @@
+# systemd user service: one bank-pull sync. Started by bank-pull-sync.timer.
+# Install: copy both files to ~/.config/systemd/user/, then
+#   systemctl --user daemon-reload && systemctl --user enable --now bank-pull-sync.timer
+[Unit]
+Description=bank-pull sync (Enable Banking to local SQLite)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# bank-pull starts with "#!/usr/bin/env node": node 24.10+ must be on this PATH.
+# Add its directory in front if it lives elsewhere (mise, nvm, ...).
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=%h/.local/bin/bank-pull sync
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes

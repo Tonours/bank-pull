@@ -1,0 +1,14 @@
+# Once a day: banks often allow only 4 background fetches per account per day, and a sync
+# makes one request per transactions page plus one for balances per account. Move to
+# OnCalendar=*-*-* 07,19:00:00 only if your bank does not rate-limit you (exit 4).
+[Unit]
+Description=bank-pull sync once a day
+
+[Timer]
+OnCalendar=*-*-* 07:00:00
+RandomizedDelaySec=10min
+# Persistent=true would add a catch-up run after boot when 07:00 was missed.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

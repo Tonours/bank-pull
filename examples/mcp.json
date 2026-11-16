@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "bank-pull": {
+      "command": "bank-pull",
+      "args": ["mcp"]
+    }
+  }
+}
