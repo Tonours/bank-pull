@@ -13,3 +13,4 @@ dist-test/
 *.csv
 !test/fixtures/**/*.csv
 PLAN.md
+docs/plan/
