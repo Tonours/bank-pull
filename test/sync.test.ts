@@ -507,3 +507,60 @@ test("SIGKILL between two pages of a sync: page 1 kept, cursor and pending uncha
   const out = JSON.parse(run.stdout) as { accounts: { inserted: number }[] };
   assert.equal(out.accounts[0]?.inserted, 1);
 });
+
+/** A second, independent bank with its own account (distinct identification_hash and uid). */
+async function twoBanks(): Promise<{ h: Harness; first: string; second: string }> {
+  const h = await harness();
+  const other = { name: "Other Bank", country: "FR" } as const;
+  h.api.state.aspsps.push({ ...other, psu_types: ["personal"], maximum_consent_validity: 15_552_000 });
+  const a = session("sess-a", 1, "code-a");
+  const base = session("sess-b", 1, "code-b");
+  const b = {
+    ...base,
+    uids: ["sess-b-uid-0"],
+    session: { ...base.session, aspsp: other, accounts: [{ ...base.session.accounts[0], uid: "sess-b-uid-0", identification_hash: "hash-other", name: "Other account" }] },
+  } as typeof base;
+  install(h.api, a, [[[tx()]]]);
+  install(h.api, b, [[[tx()]]]);
+  assert.equal((await h.run(authArgs, { paste: (api) => callback(api, "code-a"), now: NOW })).code, 0);
+  const auth = await h.run(["auth", "--bank", other.name, "--country", "FR"], { paste: (api) => callback(api, "code-b"), now: NOW });
+  assert.equal(auth.code, 0, auth.stderr);
+  return { h, first: a.uids[0] ?? "", second: b.uids[0] ?? "" };
+}
+
+test("several banks: one bank rate-limited does not stop the others; exit 4 and the failure is reported", async () => {
+  const { h, first, second } = await twoBanks();
+  assert.equal(n(h, "SELECT count(DISTINCT aspsp_name) AS v FROM sessions"), 2);
+  h.api.state.pages.set(second, [[tx()]]);
+  h.api.state.failTransactions.set(first, { atRequest: 2, error: { status: 429, error: "ASPSP_RATE_LIMIT_EXCEEDED" } });
+  const run = await sync(h, NOW, true);
+  assert.equal(run.code, ExitCode.rateLimit, run.stderr);
+  const out = JSON.parse(run.stdout) as { accounts: { name: string; inserted: number }[]; failures: { name: string; exit_code: number }[] };
+  assert.deepEqual(out.accounts.map((a) => [a.name, a.inserted]), [["Other account", 1]]);
+  assert.deepEqual(out.failures.map((f) => [f.name, f.exit_code]), [["Synthetic account 0", ExitCode.rateLimit]]);
+  assert.match(run.stderr, /Synthetic account 0: .*rate limit/i);
+  h.api.state.failTransactions.clear();
+  const ok = await sync(h, NOW, true);
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.deepEqual((JSON.parse(ok.stdout) as { failures: unknown[] }).failures, []);
+});
+
+test("several banks: different failures give exit 1", async () => {
+  const { h, first, second } = await twoBanks();
+  h.api.state.failTransactions.set(first, { atRequest: 2, error: { status: 429, error: "ASPSP_RATE_LIMIT_EXCEEDED" } });
+  h.api.state.failTransactions.set(second, { atRequest: 2, error: { status: 401, error: "EXPIRED_SESSION" } });
+  const run = await sync(h);
+  assert.equal(run.code, ExitCode.failure, run.stderr);
+});
+
+test("revoke --bank closes that bank's latest consent only", async () => {
+  const { h } = await twoBanks();
+  const run = await h.run(["revoke", "--bank", "Other Bank (beta)"], { now: NOW });
+  assert.equal(run.code, 0, run.stderr);
+  assert.deepEqual(h.api.state.deletedSessions, ["sess-b"]);
+  assert.equal(h.value("SELECT group_concat(aspsp_name) AS v FROM sessions"), BANK.name);
+  const again = await h.run(["revoke", "--bank", "Other Bank"], { now: NOW });
+  assert.equal(again.code, ExitCode.failure);
+  assert.match(again.stderr, /no stored consent for Other Bank/);
+  assert.equal((await h.run(["revoke", "--bank", "Other Bank", "--session", "x"], { now: NOW })).code, ExitCode.usage);
+});

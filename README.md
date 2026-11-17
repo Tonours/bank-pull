@@ -105,6 +105,22 @@ bank-pull sync      # fetch new transactions and balances
 bank-pull status    # offline: last sync, consent expiry, warnings
 ```
 
+### Several banks
+
+Each bank needs its own consent. In restricted mode, first link that bank's accounts
+in the Enable Banking control panel, then run one `auth` per bank, for example:
+
+```sh
+bank-pull auth --bank "Boursorama Banque" --country FR
+bank-pull auth --bank "PayPal" --country FR
+```
+
+`sync` then covers every account of every bank with a valid consent. A failing
+account (expired consent, rate limit, bank error) does not stop the others: it is
+reported on stderr and in the `failures` array of `sync --json`, and the exit code is
+that failure's code (1 when failures have different codes). `revoke --bank <name>`
+closes the latest consent of one bank only.
+
 ## Commands
 
 Every command except `init`, `banks`, `auth`, `revoke` and `sync` works offline and
@@ -115,13 +131,13 @@ never reads the config file or the key. `--json` prints machine-readable output.
 | `init --app-id <id> --key <path> --redirect-url <https-url> [--force]` | Validates the key, writes `config.json` (mode `600`), creates the database. `--force` overwrites an existing config. |
 | `banks --country <CC> [--json]` | Lists banks available for personal accounts in that country (`(beta)` when Enable Banking flags them). |
 | `auth --bank <name> --country <CC> [--json]` | Opens a consent (the bank's maximum, at most 180 days), takes the pasted redirect URL, stores the session and backfills every account. |
-| `sync [--json]` | Fetches new transactions and balances for every account with a valid consent. |
+| `sync [--json]` | Fetches new transactions and balances for every account with a valid consent. One failing account does not stop the others (see Several banks). |
 | `status [--json]` | Per account: synced-through date, booked and pending counts, consent expiry, history gaps and warnings. |
 | `accounts [--json]` | Accounts with their latest balances per type and currency. |
 | `transactions [filters] [--json]` | Transactions, newest first. Filters: `--account <id>`, `--from`/`--to YYYY-MM-DD`, `--text <s>` (label, counterparty or note), `--category <c>` (`""` = uncategorized), `--status BOOK\|PDNG\|HOLD\|SCHD\|OTHR\|pending`, `--min-amount`/`--max-amount <n>` (signed decimal; write negatives as `--max-amount=-12.30`), `--limit <n>` (default 100, max 5000). |
 | `query "<SELECT ...>" [--max-rows <n>] [--json]` | One read-only SQL statement on the database (default 500 rows, max 5000). Writes, `ATTACH`, `PRAGMA`, `VACUUM` and a second statement are refused. |
 | `categorize --id <n> [--category <c>] [--note <text>] [--json]` | Sets the category and/or note of one booked transaction. An empty value clears it, an omitted one is kept. |
-| `revoke [--session <id>]` | Closes the latest consent (or the given one) at the bank and forgets it locally. Synced transactions stay. |
+| `revoke [--session <id> \| --bank <name>]` | Closes the latest consent (or the given one, or the latest of that bank) at the bank and forgets it locally. Synced transactions stay. |
 | `mcp` | Starts the stdio MCP server (see below). |
 
 Amounts are signed (debits negative) decimal strings in the transaction currency;

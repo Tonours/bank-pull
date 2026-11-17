@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
+import type { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import { parseArgs, type ParseArgsConfig } from "node:util";
 import { assertPrivate, ensurePrivateDir, loadConfig, resolvePaths, type Config, type Env, type Paths } from "./config.js";
@@ -33,7 +34,7 @@ Commands:
                          list banks available through Enable Banking
   auth --bank <name> --country <CC> [--json]
                          open a bank consent, paste the redirect URL, then backfill
-  revoke [--session <id>]
+  revoke [--session <id> | --bank <name>]
                          close the latest consent at the bank and forget it locally
   sync [--json]          fetch new transactions and balances for every consented account
   status [--json]        offline: cursor, consent expiry and history gaps per account
@@ -220,6 +221,13 @@ async function auth(args: readonly string[], paths: Paths, io: Io): Promise<numb
       const ctx: SyncContext = { db, client: api, lockToken: token, now };
       const accounts = persistSession(ctx, session);
       io.stderr(printable(`consent stored (session ${session.session_id}, ${accounts.length} account(s), valid until ${session.access.valid_until})`) + "\n");
+      if (accounts.length === 0) {
+        io.stderr(
+          printable(
+            `warning: ${session.aspsp.name} returned no account; in restricted mode, link this bank's accounts in the Enable Banking control panel, then run "bank-pull revoke --bank ${JSON.stringify(session.aspsp.name)}" and "bank-pull auth" again`,
+          ) + "\n",
+        );
+      }
       const results: AccountResult[] = [];
       for (const acc of accounts) results.push(await backfillAccount(ctx, acc.id, acc.uid, acc.gaps));
       if (values.json === true) io.stdout(`${JSON.stringify({ session_id: session.session_id, accounts: results }, null, 2)}\n`);
@@ -234,7 +242,8 @@ async function auth(args: readonly string[], paths: Paths, io: Io): Promise<numb
 }
 
 async function revoke(args: readonly string[], paths: Paths, io: Io): Promise<number> {
-  const values = parse(args, { session: { type: "string" } });
+  const values = parse(args, { session: { type: "string" }, bank: { type: "string" } });
+  if (values.session !== undefined && values.bank !== undefined) throw new CliError("pass --session or --bank, not both", ExitCode.usage);
   const api = client(loadConfig(paths), io.env);
   const db = openReadWrite(paths);
   let token: string | undefined;
@@ -243,9 +252,11 @@ async function revoke(args: readonly string[], paths: Paths, io: Io): Promise<nu
     const row = (
       typeof values.session === "string"
         ? db.prepare("SELECT id FROM sessions WHERE id = ?").get(values.session)
-        : db.prepare("SELECT id FROM sessions ORDER BY created_at DESC, rowid DESC LIMIT 1").get()
+        : typeof values.bank === "string"
+          ? latestOfBank(db, values.bank) ?? latestOfBank(db, values.bank.replace(/ \(beta\)$/, ""))
+          : db.prepare("SELECT id FROM sessions ORDER BY created_at DESC, rowid DESC LIMIT 1").get()
     ) as { id: string } | undefined;
-    if (row === undefined) throw new CliError("no stored consent to revoke");
+    if (row === undefined) throw new CliError(typeof values.bank === "string" ? `no stored consent for ${values.bank}` : "no stored consent to revoke");
     let note = "closed at the bank";
     try {
       await api.deleteSession(row.id);
@@ -262,12 +273,28 @@ async function revoke(args: readonly string[], paths: Paths, io: Io): Promise<nu
   }
 }
 
+interface SyncFailure {
+  readonly account_id: number;
+  readonly name: string;
+  readonly exit_code: number;
+  readonly error: string;
+}
+
+function accountName(db: DatabaseSync, id: number): string {
+  const row = db.prepare("SELECT name, identification_hash FROM accounts WHERE id = ?").get(id) as { name: string | null; identification_hash: string };
+  return row.name ?? row.identification_hash.slice(0, 12);
+}
+
+const latestOfBank = (db: DatabaseSync, name: string): unknown =>
+  db.prepare("SELECT id FROM sessions WHERE aspsp_name = ? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(name);
+
 const expiredError = (accounts: number): CliError =>
   new CliError(`bank consent expired for ${accounts} account(s); run "bank-pull auth" again`, ExitCode.consent);
 
 /**
  * Syncs every account whose latest consent is still valid. Expired consents are reported (exit 3) without a request;
- * any API error stops the run with its own exit code and no retry.
+ * an API error on one account is reported and the others still sync (no retry); a lost lock or a permission problem
+ * stops the run. The exit code is the code shared by every failure, 1 when they differ.
  */
 async function sync(args: readonly string[], paths: Paths, io: Io): Promise<number> {
   const values = parse(args, { json: { type: "boolean" } });
@@ -278,6 +305,7 @@ async function sync(args: readonly string[], paths: Paths, io: Io): Promise<numb
     // Consents are read under the lock, so a concurrent auth or revoke cannot hand this run a stale uid.
     const token = acquireLock(db, now);
     const results: AccountResult[] = [];
+    const failures: SyncFailure[] = [];
     let expired = 0;
     try {
       const usable: { id: number; uid: string }[] = [];
@@ -289,20 +317,32 @@ async function sync(args: readonly string[], paths: Paths, io: Io): Promise<numb
       }
       if (usable.length === 0) throw expired > 0 ? expiredError(expired) : new CliError('no stored consent; run "bank-pull auth" first');
       const ctx: SyncContext = { db, client: api, lockToken: token, now };
-      for (const acc of usable) results.push(await syncAccount(ctx, acc.id, acc.uid));
+      for (const acc of usable) {
+        try {
+          results.push(await syncAccount(ctx, acc.id, acc.uid));
+        } catch (error) {
+          // One bank failing (rate limit, expired consent, bad data) must not stop the others; a lost lock or an
+          // unsafe file still aborts the whole run.
+          if (!(error instanceof CliError) || error.exitCode === ExitCode.locked || error.exitCode === ExitCode.permissions) throw error;
+          failures.push({ account_id: acc.id, name: accountName(db, acc.id), exit_code: error.exitCode, error: error.message });
+        }
+      }
     } finally {
       releaseLock(db, token);
     }
     const statuses = syncStatus(db, now);
     if (values.json === true) {
       const accounts = results.map((r) => ({ ...r, warnings: [...r.warnings, ...(statuses.find((s) => s.account_id === r.account_id)?.warnings ?? [])] }));
-      io.stdout(`${JSON.stringify({ accounts }, null, 2)}\n`);
+      io.stdout(`${JSON.stringify({ accounts, failures }, null, 2)}\n`);
     } else {
       summarize(results, statuses, io);
     }
-    if (expired === 0) return 0;
-    io.stderr(`bank-pull: ${expiredError(expired).message}\n`);
-    return ExitCode.consent;
+    for (const f of failures) io.stderr(`bank-pull: ${printable(`${f.name}: ${f.error}`)}\n`);
+    if (expired > 0) io.stderr(`bank-pull: ${expiredError(expired).message}\n`);
+    const codes = new Set([...failures.map((f) => f.exit_code), ...(expired > 0 ? [ExitCode.consent] : [])]);
+    if (codes.size === 0) return 0;
+    // One kind of failure keeps its specific exit code; a mix is a plain failure.
+    return codes.size === 1 ? [...codes][0] ?? ExitCode.failure : ExitCode.failure;
   } finally {
     db.close();
   }

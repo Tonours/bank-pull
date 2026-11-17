@@ -350,6 +350,16 @@ test("auth accepts the bank name exactly as `banks` prints it, beta marker inclu
   assert.equal(run.code, 0, run.stderr);
 });
 
+test("auth warns when the bank returns no account (restricted mode, nothing linked)", async () => {
+  const h = await harness();
+  const s = session("s", 1);
+  install(h.api, { ...s, session: { ...s.session, accounts: [] }, uids: [] }, []);
+  const run = await h.run(["auth", "--bank", BANK.name, "--country", "FR"], { paste: (api) => callback(api) });
+  assert.equal(run.code, 0, run.stderr);
+  assert.match(run.stderr, /0 account\(s\)/);
+  assert.match(run.stderr, /returned no account; in restricted mode, link this bank's accounts/);
+});
+
 test("an unknown bank name is refused with suggestions, before POST /auth", async () => {
   const h = await harness();
   const run = await h.run(["auth", "--bank", "synthetic", "--country", "FR"], { paste: () => "unused" });
